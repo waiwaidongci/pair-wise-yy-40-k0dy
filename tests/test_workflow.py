@@ -10,9 +10,11 @@ class WorkflowTest(unittest.TestCase):
     def test_complete_workflow_and_audit(self):
         item=self.service.create_item({"title":"workflow item","description":"complete business flow","severity":'high',"quantity":12,"threshold":6,"external_ref":"WF-1"},"creator",'assessor')
         self.assertEqual(item["status"],STATES[0])
-        self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'assessor')
-        current=item
-        for target in STATES[1:]:
+        record=self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'assessor')
+        current=self.service.transition(item["id"],STATES[1],item["version"],"reviewer",TRANSITION_ROLES[STATES[1]][0])
+        plan=self.service.submit_plan(current["id"],{"content":"reinforcement plan","record_ids":[record["id"]]},"engineer",'structural_engineer')
+        self.service.review_plan(plan["id"],{"decision":"approve"},"board",'review_board')
+        for target in STATES[2:]:
             current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
         self.assertEqual(current["status"],STATES[-1])
         self.assertEqual(len(self.service.list_records(current["id"],"viewer")),1)

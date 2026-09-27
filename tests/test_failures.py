@@ -15,7 +15,10 @@ class FailureTest(unittest.TestCase):
         payload={"kind":"action","detail":"same reference","status":"open","external_ref":"DUP-1"}
         self.service.add_record(self.item["id"],payload,"recorder",'assessor')
         with self.assertRaises(ConflictError): self.service.add_record(self.item["id"],payload,"recorder",'assessor')
-        current=self.service.get_item(self.item["id"],"viewer")
-        for target in STATES[1:4]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
+        closed=self.service.add_record(self.item["id"],{"kind":"evidence","detail":"closed basis","status":"closed","external_ref":"CL-1"},"recorder",'assessor')
+        current=self.service.transition(self.item["id"],STATES[1],self.item["version"],"reviewer",TRANSITION_ROLES[STATES[1]][0])
+        plan=self.service.submit_plan(current["id"],{"content":"plan","record_ids":[closed["id"]]},"engineer",'structural_engineer')
+        self.service.review_plan(plan["id"],{"decision":"approve"},"board",'review_board')
+        for target in STATES[2:4]: current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
         with self.assertRaises(ConflictError): self.service.transition(current["id"],"accepted",current["version"],"reviewer",TRANSITION_ROLES["accepted"][0])
 if __name__=="__main__": unittest.main()
