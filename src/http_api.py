@@ -89,6 +89,16 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/plans"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"plans": service.list_plans(item_id, role)})
+                elif path.startswith("/api/plans/"):
+                    plan_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.plan_detail(plan_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -119,6 +129,25 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/plans"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.submit_plan(item_id, body, actor, role))
+                else:
+                    self._json(404, {"error": "not_found"})
+            except Exception as exc:
+                self._send_error(exc)
+
+        def do_PUT(self) -> None:
+            try:
+                path = urlparse(self.path).path
+                actor, role = self._identity()
+                body = self._body()
+                if path.startswith("/api/records/"):
+                    record_id = int(path.rsplit("/", 1)[-1])
+                    self._json(200, service.update_record(record_id, body, actor, role))
+                elif path.startswith("/api/plans/") and path.endswith("/review"):
+                    plan_id = int(path.split("/")[3])
+                    self._json(200, service.review_plan(plan_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

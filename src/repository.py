@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import ConflictError, NotFoundError, ValidationError
+from .rules import (ASSESSMENT_KIND, ID_PREFIX, PLAN_APPROVED,
+                    PLAN_INVALIDATED, PLAN_PENDING, REGRESS_ON_INVALIDATE,
+                    STATES, design_gate_reason, record_change_reason,
+                    supersede_reason)
 
 
 class Repository:
@@ -53,6 +56,29 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending','approved','rejected','invalidated')),
+                    submitted_by TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    review_comment TEXT,
+                    reject_reason TEXT,
+                    invalid_reason TEXT,
+                    UNIQUE(item_id, version)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_plans_one_pending
+                    ON plans(item_id) WHERE status='pending';
+                CREATE TABLE IF NOT EXISTS plan_basis (
+                    plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    PRIMARY KEY(plan_id, record_id)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,15 +137,20 @@ class Repository:
                         actor: str) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
+            current = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if current is None:
+                raise NotFoundError("项目不存在")
+            if target == "design":
+                reason = design_gate_reason(self.get_latest_plan(item_id))
+                if reason:
+                    raise ConflictError(reason)
             cur = self.conn.execute(
                 """UPDATE items SET status=?, version=version+1, updated_at=?
                    WHERE id=? AND version=?""",
                 (target, now, item_id, expected_version),
             )
             if cur.rowcount == 0:
-                exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
-                if exists is None:
-                    raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
@@ -135,11 +166,29 @@ class Repository:
                     (item_id, kind, detail, status, external_ref, actor, now),
                 )
                 record_id = int(cur.lastrowid)
+                invalidated = self._invalidate_approved_locked(
+                    item_id, record_change_reason(kind, "add"))
+                row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
         except sqlite3.IntegrityError as exc:
             raise ConflictError("记录唯一标识已存在") from exc
-        with self._lock:
+        return dict(row), invalidated
+
+    def update_record(self, record_id: int, kind: str, detail: str, status: str,
+                      external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
             row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
-        return dict(row)
+            if row is None:
+                raise NotFoundError("评估事项不存在")
+            self.conn.execute(
+                """UPDATE records SET kind=?, detail=?, status=?, external_ref=?
+                   WHERE id=?""",
+                (kind, detail, status, external_ref, record_id),
+            )
+            invalidated = self._invalidate_approved_locked(
+                row["item_id"], record_change_reason(kind, "update"))
+            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        return dict(row), invalidated
 
     def list_records(self, item_id: int) -> List[Dict[str, Any]]:
         self.get_item(item_id)
@@ -156,6 +205,135 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    # ---- 加固方案 ----
+
+    def _invalidate_approved_locked(self, item_id: int,
+                                    reason: Optional[str]) -> Optional[Dict[str, Any]]:
+        """同一事务内让已同意方案失效；设计阶段退回评估，施工及以后不倒退。"""
+        if not reason:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM plans WHERE item_id=? AND status=?",
+            (item_id, PLAN_APPROVED),
+        ).fetchone()
+        if row is None:
+            return None
+        self.conn.execute(
+            "UPDATE plans SET status=?, invalid_reason=? WHERE id=?",
+            (PLAN_INVALIDATED, reason, row["id"]),
+        )
+        item = self.conn.execute("SELECT status FROM items WHERE id=?", (item_id,)).fetchone()
+        regressed = item["status"] in REGRESS_ON_INVALIDATE
+        if regressed:
+            self.conn.execute(
+                """UPDATE items SET status='assessed', version=version+1, updated_at=?
+                   WHERE id=?""",
+                (utc_now(), item_id),
+            )
+        result = dict(row)
+        result["status"] = PLAN_INVALIDATED
+        result["invalid_reason"] = reason
+        result["regressed"] = regressed
+        return result
+
+    def create_plan(self, item_id: int, content: str, basis_ids: list,
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            item = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item is None:
+                raise NotFoundError("项目不存在")
+            if item["status"] not in ("assessed", "design", "construction"):
+                raise ConflictError("当前项目状态不允许提交加固方案")
+            for record_id in basis_ids:
+                row = self.conn.execute(
+                    "SELECT * FROM records WHERE id=? AND item_id=?",
+                    (record_id, item_id),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"依据事项{record_id}不存在")
+                if row["kind"] != ASSESSMENT_KIND:
+                    raise ValidationError(f"事项{record_id}不是评估事项，不能作为方案依据")
+                if row["status"] != "closed":
+                    raise ConflictError(f"依据事项{record_id}尚未关闭，不能提交方案")
+            pending = self.conn.execute(
+                "SELECT 1 FROM plans WHERE item_id=? AND status=?",
+                (item_id, PLAN_PENDING),
+            ).fetchone()
+            if pending is not None:
+                raise ConflictError("同一项目只能保留一份待复核方案")
+            ver_row = self.conn.execute(
+                "SELECT COALESCE(MAX(version),0) AS v FROM plans WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            version = int(ver_row["v"]) + 1
+            superseded = self._invalidate_approved_locked(
+                item_id, supersede_reason(version))
+            cur = self.conn.execute(
+                """INSERT INTO plans(item_id, version, content, status, submitted_by,
+                   submitted_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, version, content, PLAN_PENDING, actor, now),
+            )
+            plan_id = int(cur.lastrowid)
+            self.conn.executemany(
+                "INSERT INTO plan_basis(plan_id, record_id) VALUES(?,?)",
+                [(plan_id, rid) for rid in basis_ids],
+            )
+        return self.get_plan(plan_id), superseded
+
+    def get_plan(self, plan_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("加固方案不存在")
+        return dict(row)
+
+    def list_plans(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM plans WHERE item_id=? ORDER BY version", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_latest_plan(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM plans WHERE item_id=? ORDER BY version DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def plan_basis_ids(self, plan_id: int) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT record_id FROM plan_basis WHERE plan_id=? ORDER BY record_id",
+                (plan_id,),
+            ).fetchall()
+        return [int(r["record_id"]) for r in rows]
+
+    def review_plan(self, plan_id: int, approved: bool, comment: Optional[str],
+                    reject_reason: Optional[str], expected_version: int,
+                    actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        status = "approved" if approved else "rejected"
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("加固方案不存在")
+            if row["status"] != PLAN_PENDING:
+                raise ConflictError("仅待复核方案可评审，当前状态：" + row["status"])
+            if row["version"] != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            cur = self.conn.execute(
+                """UPDATE plans SET status=?, reviewed_by=?, reviewed_at=?,
+                   review_comment=?, reject_reason=? WHERE id=? AND status=?""",
+                (status, actor, now, comment, reject_reason, plan_id, PLAN_PENDING),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("方案状态已变化，请刷新后重试")
+        return self.get_plan(plan_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
